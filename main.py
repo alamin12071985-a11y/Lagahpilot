@@ -16,7 +16,7 @@ from telegram.ext import (
 
 # Configuration
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # Set this in Render Environment Variables
-TRUSTED_USERS = [123456789, 987654321]  # Replace with actual Telegram User IDs
+TRUSTED_USERS = [6040791692, 8244641590]  # Replace with actual Telegram User IDs
 MAX_FILE_SIZE = 50 * 1024  # 50 KB
 TIMEOUT_SECONDS = 120
 USERS_DIR = "users"
