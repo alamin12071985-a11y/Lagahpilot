@@ -25,7 +25,7 @@ try {
     admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
         // আপনার ডাটাবেস URL এখানে দিন (Firebase Console > Realtime Database)
-        databaseURL: "https://YOUR_PROJECT_ID-default-rtdb.firebaseio.com" 
+        databaseURL: "https://fir-55206-default-rtdb.firebaseio.com" 
     });
     console.log("🔥 Firebase Connected Successfully!");
 } catch (error) {
