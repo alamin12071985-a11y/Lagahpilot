@@ -1,19 +1,29 @@
 require('dotenv').config();
-const { Telegraf } = require('telegraf');
 const express = require('express');
-const cors = require('cors');
-const path = require('path');
+const { Telegraf } = require('telegraf');
 const admin = require("firebase-admin");
-const fs = require('fs');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const path = require('path');
 
 const app = express();
-app.use(express.json());
-app.use(cors({ origin: '*' }));
+
+// --- SECURITY ---
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(cors());
+app.use(express.json({ limit: '10kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// --- Firebase Initialization ---
-// নোট: Render-এ হোস্ট করার সময় এনভায়রনমেন্ট ভেরিয়েবল ব্যবহার করা ভালো,
-// তবে সহজ করার জন্য আমরা এখানে ফাইল রিড করছি।
+// Rate Limiting
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, 
+    max: 100, 
+    message: "Too many requests, slow down!"
+});
+app.use('/api/', limiter);
+
+// --- FIREBASE ADMIN INIT ---
 let serviceAccount;
 try {
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
@@ -21,184 +31,154 @@ try {
     } else {
         serviceAccount = require("./firebase-key.json");
     }
-
     admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
-        // আপনার ডাটাবেস URL এখানে দিন (Firebase Console > Realtime Database)
-        databaseURL: "https://fir-55206-default-rtdb.firebaseio.com" 
+        // আপনার দেওয়া কনফিগ অনুযায়ী ডাটাবেস লিংক
+        databaseURL: "https://fir-55206-default-rtdb.firebaseio.com"
     });
-    console.log("🔥 Firebase Connected Successfully!");
-} catch (error) {
-    console.error("❌ Firebase Init Error: 'firebase-key.json' missing or invalid URL.");
-    console.error("Make sure to replace databaseURL in server.js line 27");
-}
+} catch (e) { console.error("Firebase Admin Error:", e.message); }
 
 const db = admin.database();
-const activeBots = {}; // Store running bot instances
+const activeBots = {};
 
-// --- Bot Management Functions ---
+// --- PLANS ---
+const PLANS = {
+    free: { bots: 1, logs: false, editor: false },
+    pro: { bots: 5, logs: true, editor: true },
+    vip: { bots: 999, logs: true, editor: true }
+};
 
-async function launchBot(botId) {
+// --- AUTH MIDDLEWARE ---
+const verifyUser = async (req, res, next) => {
+    const token = req.headers.authorization;
+    if (!token) return res.status(401).json({ error: "No Access" });
     try {
-        const botSnapshot = await db.ref(`bots/${botId}`).once('value');
-        const botData = botSnapshot.val();
+        const decoded = await admin.auth().verifyIdToken(token);
+        req.user = decoded;
+        const uSnap = await db.ref(`users/${decoded.uid}`).once('value');
+        req.userData = uSnap.val();
+        if (!req.userData) return res.status(403).json({ error: "User setup incomplete" });
+        next();
+    } catch (e) { res.status(403).json({ error: "Invalid Token" }); }
+};
 
-        if (!botData || !botData.token) return false;
+// --- ENDPOINTS ---
 
-        // Stop existing instance if running
-        if (activeBots[botId]) {
-            try { await activeBots[botId].stop('SIGTERM'); } catch (e) {}
-            delete activeBots[botId];
+// Secure Login (IP Locking)
+app.post('/api/auth/login', async (req, res) => {
+    const { token } = req.body;
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    
+    try {
+        const decoded = await admin.auth().verifyIdToken(token);
+        const uid = decoded.uid;
+        
+        // Check IP Duplication
+        const ipSnap = await db.ref('ip_records').orderByValue().equalTo(ip).once('value');
+        let blockUser = false;
+
+        if (ipSnap.exists()) {
+            ipSnap.forEach(child => {
+                if (child.key !== uid) blockUser = true; // Same IP, Different Account
+            });
         }
 
-        const bot = new Telegraf(botData.token);
-        
-        // Load Commands
-        const cmdSnapshot = await db.ref(`commands/${botId}`).once('value');
-        const commands = cmdSnapshot.val() || {};
+        if (blockUser) {
+            return res.status(403).json({ error: "Security Alert: Multiple accounts detected on this IP!" });
+        }
 
-        // Register Commands
-        Object.entries(commands).forEach(([cmdName, code]) => {
-            bot.command(cmdName, async (ctx) => {
-                try {
-                    // Safety: In production, sanitize this!
-                    const runCode = new Function('ctx', code);
-                    runCode(ctx);
-                } catch (err) {
-                    ctx.reply(`⚠️ Script Error: ${err.message}`);
-                }
+        await db.ref(`ip_records/${uid}`).set(ip);
+
+        const userRef = db.ref(`users/${uid}`);
+        const uSnap = await userRef.once('value');
+        
+        if (!uSnap.exists()) {
+            await userRef.set({
+                email: decoded.email,
+                name: decoded.name || 'User',
+                plan: 'free',
+                joined: Date.now(),
+                ip: ip
             });
-        });
+        }
+        res.json({ success: true });
 
-        bot.launch();
-        activeBots[botId] = bot;
-        
-        await db.ref(`bots/${botId}`).update({ status: 'RUN' });
-        return true;
-    } catch (error) {
-        console.error(`Error launching bot ${botId}:`, error);
-        await db.ref(`bots/${botId}`).update({ status: 'STOP' });
-        return false;
-    }
-}
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-async function stopBot(botId) {
-    if (activeBots[botId]) {
-        try { await activeBots[botId].stop('SIGTERM'); } catch (e) {}
-        delete activeBots[botId];
-    }
-    await db.ref(`bots/${botId}`).update({ status: 'STOP' });
-    return true;
-}
+// Dashboard Data
+app.get('/api/dashboard', verifyUser, async (req, res) => {
+    const uid = req.user.uid;
+    const botsSnap = await db.ref('bots').orderByChild('owner').equalTo(uid).once('value');
+    const bots = [];
+    botsSnap.forEach(b => bots.push({ id: b.key, ...b.val() }));
 
-// --- API Endpoints ---
+    // Mock Stats
+    const stats = {
+        total: Math.floor(Math.random() * 5000),
+        active: Math.floor(Math.random() * 1200),
+        weekly: Math.floor(Math.random() * 300)
+    };
 
-// Get All Bots
-app.get('/api/bots', async (req, res) => {
-    try {
-        const snapshot = await db.ref('bots').once('value');
-        const bots = snapshot.val() || {};
-        // Convert object to array for frontend
-        const botList = Object.keys(bots).map(key => ({
-            botId: key,
-            ...bots[key]
-        }));
-        res.json(botList);
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+    res.json({ plan: req.userData.plan, bots, stats });
 });
 
 // Create Bot
-app.post('/api/createBot', async (req, res) => {
-    const { token, name } = req.body;
-    if (!token || !name) return res.status(400).json({ error: "Missing fields" });
+app.post('/api/createBot', verifyUser, async (req, res) => {
+    const limit = PLANS[req.userData.plan].bots;
+    const botsSnap = await db.ref('bots').orderByChild('owner').equalTo(req.user.uid).once('value');
+    
+    if (botsSnap.numChildren() >= limit) return res.status(403).json({ error: "Upgrade Plan Required!" });
 
-    const botId = Date.now().toString(); // Simple ID generation
-    const newBot = {
-        token,
-        name,
-        status: 'STOP',
-        createdAt: admin.database.ServerValue.TIMESTAMP
-    };
-
-    try {
-        await db.ref(`bots/${botId}`).set(newBot);
-        res.json({ success: true, botId });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+    const { name, token } = req.body;
+    const botId = Date.now().toString();
+    await db.ref(`bots/${botId}`).set({ name, token, owner: req.user.uid, status: 'STOP' });
+    res.json({ success: true });
 });
 
-// Delete Bot
-app.post('/api/deleteBot', async (req, res) => {
-    const { botId } = req.body;
-    try {
-        await stopBot(botId);
-        await db.ref(`bots/${botId}`).remove();
-        await db.ref(`commands/${botId}`).remove();
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
+// Toggle Bot
+app.post('/api/toggleBot', verifyUser, async (req, res) => {
+    const { botId, action } = req.body;
+    const botRef = await db.ref(`bots/${botId}`).once('value');
+    if (botRef.val().owner !== req.user.uid) return res.status(403).json({ error: "Unauthorized" });
+
+    if (action === 'start') {
+        if (activeBots[botId]) activeBots[botId].stop();
+        try {
+            const bot = new Telegraf(botRef.val().token);
+            bot.context.db = db;
+            bot.context.botId = botId;
+            
+            // Commands Load
+            const cmds = (await db.ref(`commands/${botId}`).once('value')).val() || {};
+            Object.entries(cmds).forEach(([c, code]) => {
+                bot.command(c, async (ctx) => {
+                    try { new Function('ctx', code)(ctx); } catch(e){ ctx.reply('Error: '+e.message); }
+                });
+            });
+
+            bot.launch();
+            activeBots[botId] = bot;
+            await db.ref(`bots/${botId}`).update({ status: 'RUN' });
+        } catch (e) { return res.status(500).json({ error: "Invalid Token" }); }
+    } else {
+        if (activeBots[botId]) activeBots[botId].stop();
+        delete activeBots[botId];
+        await db.ref(`bots/${botId}`).update({ status: 'STOP' });
     }
+    res.json({ success: true });
 });
 
-// Toggle Bot (Start/Stop)
-app.post('/api/toggleBot', async (req, res) => {
-    const { botId, action } = req.body; // action: 'start' or 'stop'
-    try {
-        if (action === 'start') {
-            await launchBot(botId);
-        } else {
-            await stopBot(botId);
-        }
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// Get Commands
-app.get('/api/commands', async (req, res) => {
-    const { botId } = req.query;
-    try {
-        const snapshot = await db.ref(`commands/${botId}`).once('value');
-        res.json(snapshot.val() || {});
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// Save Command
-app.post('/api/saveCommand', async (req, res) => {
-    const { botId, commandName, code } = req.body;
-    try {
-        await db.ref(`commands/${botId}/${commandName}`).set(code);
-        // Restart bot to apply changes if running
-        if (activeBots[botId]) {
-            await stopBot(botId);
-            await launchBot(botId);
-        }
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// Delete Command
-app.post('/api/deleteCommand', async (req, res) => {
-    const { botId, commandName } = req.body;
-    try {
-        await db.ref(`commands/${botId}/${commandName}`).remove();
-        if (activeBots[botId]) {
-            await stopBot(botId);
-            await launchBot(botId);
-        }
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+// Payment Request
+app.post('/api/payment', verifyUser, async (req, res) => {
+    const { trxId, plan, method } = req.body;
+    await db.ref('payment_requests').push({
+        uid: req.user.uid,
+        email: req.userData.email,
+        trxId, plan, method, time: Date.now()
+    });
+    res.json({ success: true });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 LagaHost Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`💎 Laga Host Server on ${PORT}`));
